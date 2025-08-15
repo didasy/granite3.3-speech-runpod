@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Python deps
 RUN pip install --upgrade --no-cache-dir \
       "transformers>=4.52.4" torchaudio peft soundfile accelerate \
-      huggingface_hub runpod requests yt-dlp webrtcvad minio
+      huggingface_hub runpod requests yt-dlp webrtcvad-wheels minio
 
 WORKDIR /app
 COPY handler.py /app/handler.py
