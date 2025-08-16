@@ -505,6 +505,27 @@ def _make_chunks(n_samples: int, sr: int, chunk_s: float, overlap_s: float) -> L
     return spans
 
 # ============================================================
+# SRT split helper
+# ============================================================
+
+def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
+    if len(text) <= max_chars_per_cue:
+        return [text]
+    words = text.split()
+    parts, cur = [], ""
+    for w in words:
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= max_chars_per_cue:
+            cur += " " + w
+        else:
+            parts.append(cur)
+            cur = w
+    if cur:
+        parts.append(cur)
+    return parts
+
+# ============================================================
 # Prompt builder
 # ============================================================
 def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], target_lang: Optional[str]) -> str:
@@ -731,10 +752,23 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         full_text_parts.append(txt)
 
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
-        block = _wrap_lines(txt, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
-        srt_entries.append(f"{srt_index}\n{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}\n{block}\n")
-
-        srt_index += 1
+        # Split long text to ensure SRT contains all words, not just 2 lines
+        max_chars_per_cue = SRT_MAX_CHARS_PER_LINE * SRT_MAX_LINES
+        pieces = _split_text_even(txt, max_chars_per_cue)
+        total_chars = sum(len(p) for p in pieces) or 1
+        cursor = start_sec
+        for i, p in enumerate(pieces):
+            # Distribute segment time proportional to chars
+            dur = (end_sec - start_sec) * (len(p) / total_chars)
+            st_s = cursor
+            en_s = end_sec if i == len(pieces) - 1 else min(end_sec, cursor + dur)
+            block = _wrap_lines(p, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
+            srt_entries.append(f"{srt_index}
+{_sec_to_srt_ts(st_s)} --> {_sec_to_srt_ts(en_s)}
+{block}
+")
+            srt_index += 1
+            cursor = en_s
 
     joined_text = " ".join([t for t in full_text_parts if t]).strip()
     srt_text = "\n".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
