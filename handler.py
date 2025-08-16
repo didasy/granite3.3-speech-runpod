@@ -16,7 +16,7 @@ from minio import Minio
 # ============================================================
 MODEL_ID = os.getenv("MODEL_ID", "ibm-granite/granite-speech-3.3-8b")
 
-# Sample rate & mono
+# Audio normalization
 SR_TARGET = 16000
 MONO_CH = 1
 
@@ -87,7 +87,15 @@ else:
 # ============================================================
 LOAD_T0 = time.time()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-tokenizer = processor.tokenizer
+# Some processors expose .tokenizer; keep a reference if available
+tokenizer = getattr(processor, "tokenizer", None)
+if tokenizer is None:
+    # Fallback: many processors still provide tokenizer via attribute
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    except Exception:
+        raise RuntimeError("Tokenizer not found on processor and AutoTokenizer fallback failed.")
 model = AutoModelForSpeechSeq2Seq.from_pretrained(
     MODEL_ID, device_map="auto", torch_dtype=TORCH_DTYPE
 )
@@ -240,7 +248,6 @@ def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional
 
         extractor_args = {"youtube": {"player_client": yt_opts.get("player_clients") or ["android", "web"]}}
 
-        # Write into tmpdir without chdir by using absolute outtmpl
         outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
         ydl_opts = {
             "format": yt_opts.get("format") or YTDLP_FORMAT,
@@ -285,11 +292,11 @@ def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional
                     "optionally set `yt_proxy` and/or `yt_geo_country`.")
         raise RuntimeError(f"YouTube download failed: {msg}.{hint}") from e
     finally:
-        if cookie_tmp:
-            try:
+        try:
+            if cookie_tmp:
                 os.remove(cookie_tmp)
-            except Exception:
-                pass
+        except Exception:
+            pass
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ============================================================
@@ -519,11 +526,39 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
     return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
 # ============================================================
+# Processor input builder (fixes sampling_rate error & CPU audio)
+# ============================================================
+def build_processor_inputs(prompt_text: str, wav_clip: torch.Tensor):
+    """
+    Returns a dict ready for model.generate(**inputs).
+    Tries processor(text=..., audio=...) first, then falls back safely.
+    Ensures audio is 1-D float32 on CPU for the feature extractor.
+    """
+    audio_1d = wav_clip.squeeze(0).to(torch.float32).cpu().numpy()
+
+    # Try the common signature first
+    try:
+        return processor(text=prompt_text, audio=audio_1d,
+                         sampling_rate=SR_TARGET, return_tensors="pt")
+    except TypeError:
+        # Some processors expect 'audios' instead of 'audio'
+        try:
+            return processor(text=prompt_text, audios=audio_1d,
+                             sampling_rate=SR_TARGET, return_tensors="pt")
+        except TypeError:
+            # Final fallback: call FE + tokenizer separately
+            fe = processor.feature_extractor(audio_1d, sampling_rate=SR_TARGET, return_tensors="pt")
+            tk = tokenizer(prompt_text, return_tensors="pt")
+            fe.update(tk)
+            return fe
+
+# ============================================================
 # Core inference (single clip)
 # ============================================================
 @torch.inference_mode()
 def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]:
-    model_inputs = processor(prompt_text, wav_clip, sampling_rate=SR_TARGET, return_tensors="pt")
+    # Build inputs (audio on CPU), then move to model device
+    model_inputs = build_processor_inputs(prompt_text, wav_clip)
     model_inputs = {k: (v.to(MODEL_DEVICE) if hasattr(v, "to") else v) for k, v in model_inputs.items()}
     outputs = model.generate(**model_inputs)
     num_input_tokens = model_inputs["input_ids"].shape[-1]
@@ -665,8 +700,8 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     # Fast path (no SRT, no VAD)
     if not make_srt and not use_vad:
-        wav_dev = wav.to(torch.float32).to(MODEL_DEVICE)
-        model_inputs = processor(base_prompt, wav_dev, sampling_rate=SR_TARGET, return_tensors="pt")
+        # Build inputs with CPU audio; THEN move to device
+        model_inputs = build_processor_inputs(base_prompt, wav)  # wav is CPU tensor
         model_inputs = {k: (v.to(MODEL_DEVICE) if hasattr(v, "to") else v) for k, v in model_inputs.items()}
         outputs = model.generate(**model_inputs)
         num_input_tokens = model_inputs["input_ids"].shape[-1]
@@ -703,7 +738,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     total_new_tokens = 0
 
     for (st, en) in spans:
-        clip = wav[:, st:en].to(torch.float32).to(MODEL_DEVICE)
+        clip = wav[:, st:en]  # keep on CPU for processor
         txt, new_tok = transcribe_clip(base_prompt, clip)
         total_new_tokens += new_tok
         full_text_parts.append(txt)
