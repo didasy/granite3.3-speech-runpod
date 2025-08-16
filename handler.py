@@ -763,10 +763,8 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
             st_s = cursor
             en_s = end_sec if i == len(pieces) - 1 else min(end_sec, cursor + dur)
             block = _wrap_lines(p, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
-            srt_entries.append(f"{srt_index}
-{_sec_to_srt_ts(st_s)} --> {_sec_to_srt_ts(en_s)}
-{block}
-")
+            srt_entries.append(f"{srt_index}\n{_sec_to_srt_ts(st_s)} --> {_sec_to_srt_ts(en_s)}\n{block}\n")
+
             srt_index += 1
             cursor = en_s
 
