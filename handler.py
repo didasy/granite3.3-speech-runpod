@@ -620,8 +620,12 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     if make_srt and not srt_path:
         if not MINIO_OUTPUT_BUCKET:
             raise RuntimeError("SRT requested but no MINIO_OUTPUT_BUCKET configured.")
+        # Normalize prefix to ensure we write a real object under a folder, not the folder itself
+        prefix = (MINIO_OUTPUT_PREFIX or "")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
         safe_name = f"granite_{int(time.time())}.srt"
-        key = (MINIO_OUTPUT_PREFIX or "") + safe_name
+        key = f"{prefix}{safe_name}"
         srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"  # bare bucket/key shorthand
 
     # Gather request-level YT options and pass through
@@ -728,11 +732,15 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
         block = _wrap_lines(txt, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
-        srt_entries.append(f"{srt_index}\n{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}\n{block}\n")
+        srt_entries.append(f"{srt_index}
+{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}
+{block}
+")
         srt_index += 1
 
     joined_text = " ".join([t for t in full_text_parts if t]).strip()
-    srt_text = "\n".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
+    srt_text = "
+".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
 
     wrote_path, srt_b64 = None, None
     if srt_text and srt_path:
