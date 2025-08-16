@@ -732,15 +732,12 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
         block = _wrap_lines(txt, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
-        srt_entries.append(f"{srt_index}
-{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}
-{block}
-")
+        srt_entries.append(f"{srt_index}\n{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}\n{block}\n")
+
         srt_index += 1
 
     joined_text = " ".join([t for t in full_text_parts if t]).strip()
-    srt_text = "
-".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
+    srt_text = "\n".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
 
     wrote_path, srt_b64 = None, None
     if srt_text and srt_path:
