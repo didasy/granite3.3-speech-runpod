@@ -42,13 +42,13 @@ RETURN_SRT_BASE64_DEFAULT = os.getenv("RETURN_SRT_BASE64_DEFAULT", "true").lower
 YTDLP_FORMAT = os.getenv("YTDLP_FORMAT", "bestaudio/best")
 YTDLP_RETRIES = int(os.getenv("YTDLP_RETRIES", "3"))
 
-# MinIO (S3 compatible) — used for "type":"path" and SRT writes
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")    # e.g. "minio.yourdomain:9000"
+# MinIO (S3 compatible)
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")    # e.g. "s3.us-east-005.backblazeb2.com"
 MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 
-# Optional defaults for shorthand
+# Optional shorthand defaults
 MINIO_INPUT_BUCKET = os.getenv("MINIO_INPUT_BUCKET")
 MINIO_INPUT_PREFIX = os.getenv("MINIO_INPUT_PREFIX", "")
 MINIO_OUTPUT_BUCKET = os.getenv("MINIO_OUTPUT_BUCKET")
@@ -66,7 +66,7 @@ VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
 VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
 VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
 
-# hf_transfer fail-safe: if env enabled but package missing, disable to avoid crash
+# hf_transfer fail-safe
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
     try:
         import hf_transfer  # noqa: F401
@@ -87,15 +87,10 @@ else:
 # ============================================================
 LOAD_T0 = time.time()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-# Some processors expose .tokenizer; keep a reference if available
 tokenizer = getattr(processor, "tokenizer", None)
 if tokenizer is None:
-    # Fallback: many processors still provide tokenizer via attribute
-    try:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    except Exception:
-        raise RuntimeError("Tokenizer not found on processor and AutoTokenizer fallback failed.")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForSpeechSeq2Seq.from_pretrained(
     MODEL_ID, device_map="auto", torch_dtype=TORCH_DTYPE
 )
@@ -204,14 +199,14 @@ def minio_write_bytes(path: str, data: bytes, content_type: str = "application/o
     client.put_object(b, k, io.BytesIO(data), length=len(data), content_type=content_type)
 
 # ============================================================
-# YouTube loader with request-supplied cookies/proxy/geo/etc.
+# YouTube loader with cookies/proxy/geo/etc.
 # ============================================================
 def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, int]:
     """
     yt_opts keys (all optional):
       - cookies_b64: base64 of Netscape cookies.txt
       - cookies_text: raw Netscape cookies file content (string)
-      - cookie_path: MinIO path "minio://bucket/key" or "bucket/key" to cookies.txt
+      - cookie_path: MinIO path "minio://bucket/key" or "bucket/key"
       - proxy: e.g. "http://user:pass@host:8080"
       - geo_country: e.g. "US"
       - user_agent: UA string
@@ -286,10 +281,9 @@ def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional
     except Exception as e:
         msg = str(e)
         hint = ""
-        if "403" in msg or "Forbidden" in msg:
-            hint = (" YouTube returned 403. Provide cookies via request fields "
-                    "`yt_cookies_b64`, `yt_cookies_text`, or `yt_cookie_path`; "
-                    "optionally set `yt_proxy` and/or `yt_geo_country`.")
+        if "403" in msg or "Forbidden" in msg or "Sign in to confirm" in msg:
+            hint = (" YouTube gated the download. Provide cookies via `yt_cookies_b64`, `yt_cookies_text`, or `yt_cookie_path`; "
+                    "optionally set `yt_player_clients` and `yt_geo_country`.")
         raise RuntimeError(f"YouTube download failed: {msg}.{hint}") from e
     finally:
         try:
@@ -504,10 +498,7 @@ def _make_chunks(n_samples: int, sr: int, chunk_s: float, overlap_s: float) -> L
             break
     return spans
 
-# ============================================================
-# SRT split helper
-# ============================================================
-
+# Split long text into multiple SRT cues so SRT matches full text
 def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
     if len(text) <= max_chars_per_cue:
         return [text]
@@ -524,6 +515,18 @@ def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
     if cur:
         parts.append(cur)
     return parts
+
+# De-duplicate overlap between adjacent chunk transcripts
+def _trim_prefix_overlap(prev_tail: str, new_text: str, max_overlap: int = 80, min_overlap: int = 12) -> str:
+    prev_tail = (prev_tail or "")[-max_overlap:]
+    new_text = new_text or ""
+    upper = min(len(prev_tail), len(new_text), max_overlap)
+    for k in range(upper, min_overlap - 1, -1):
+        a = prev_tail[-k:].strip().lower()
+        b = new_text[:k].strip().lower()
+        if a == b and a:
+            return new_text[k:].lstrip()
+    return new_text
 
 # ============================================================
 # Prompt builder
@@ -554,7 +557,6 @@ def build_processor_inputs(prompt_text: str, wav_clip: torch.Tensor):
     Granite Speech expects 16k mono audio as a torch.Tensor on CPU.
     Call the processor directly with (text, audio); do NOT pass sampling_rate.
     """
-    # Keep audio on CPU; Granite's processor validates shapes internally
     audio_1d = wav_clip.squeeze(0).to(torch.float32).cpu()
     return processor(prompt_text, audio_1d, return_tensors="pt")
 
@@ -563,8 +565,8 @@ def build_processor_inputs(prompt_text: str, wav_clip: torch.Tensor):
 # ============================================================
 @torch.inference_mode()
 def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]:
-    # Build inputs (audio on CPU), then move the whole batch to model device
-    model_inputs = build_processor_inputs(prompt_text, wav_clip).to(MODEL_DEVICE)
+    inputs = build_processor_inputs(prompt_text, wav_clip)
+    model_inputs = {k: (v.to(MODEL_DEVICE) if hasattr(v, "to") else v) for k, v in inputs.items()}
     outputs = model.generate(**model_inputs)
     num_input_tokens = model_inputs["input_ids"].shape[-1]
     new_tokens = outputs[:, num_input_tokens:]
@@ -588,11 +590,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
       - max_new_tokens, temperature, num_beams
       - max_input_minutes: float; max_input_action: "reject"|"truncate"
       - max_youtube_minutes: float (YT pre-download cap)
-      - yt_cookies_b64 | yt_cookies_text | yt_cookie_path (MinIO)
-      - yt_proxy, yt_geo_country, yt_user_agent, yt_accept_language
-      - yt_player_clients: list (e.g., ["android","web"])
-      - yt_no_check_cert: bool
-      - yt_format: str (yt-dlp format)
+      - yt_* options (cookies, proxy, geo, user-agent, player_clients, format)
     """
     t0 = time.time()
 
@@ -617,7 +615,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     if "audio" not in event_input:
         raise ValueError("Missing 'audio' in input.")
 
-    # Compute YT pre-download cap (seconds) BEFORE loading audio: strictest positive among all caps
+    # Compute YT pre-download cap BEFORE loading audio
     yt_caps_sec = []
     if req_yt_minutes not in (None, ""):
         try:
@@ -641,7 +639,6 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     if make_srt and not srt_path:
         if not MINIO_OUTPUT_BUCKET:
             raise RuntimeError("SRT requested but no MINIO_OUTPUT_BUCKET configured.")
-        # Normalize prefix to ensure we write a real object under a folder, not the folder itself
         prefix = (MINIO_OUTPUT_PREFIX or "")
         if prefix and not prefix.endswith("/"):
             prefix += "/"
@@ -649,11 +646,11 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         key = f"{prefix}{safe_name}"
         srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"  # bare bucket/key shorthand
 
-    # Gather request-level YT options and pass through
+    # Gather request-level YT options
     yt_req_opts = {
         "cookies_b64":     event_input.get("yt_cookies_b64"),
         "cookies_text":    event_input.get("yt_cookies_text"),
-        "cookie_path":     event_input.get("yt_cookie_path"),  # MinIO path or bucket/key
+        "cookie_path":     event_input.get("yt_cookie_path"),
         "proxy":           event_input.get("yt_proxy"),
         "geo_country":     event_input.get("yt_geo_country"),
         "user_agent":      event_input.get("yt_user_agent"),
@@ -663,11 +660,11 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         "format":          event_input.get("yt_format"),
     }
 
-    # Load & normalize audio (pass YT cap/options)
+    # Load & normalize audio
     wav, sr0 = load_audio(event_input["audio"], youtube_cap_seconds=predownload_cap_sec, youtube_opts=yt_req_opts)
     wav = resample_and_mono(wav, sr0)
 
-    # Enforce overall length limits (strictest) AFTER load
+    # Enforce overall length limits AFTER load
     n_samples = wav.shape[-1]
     total_seconds = n_samples / SR_TARGET
 
@@ -707,27 +704,6 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
     model.generation_config.update(**gen_kwargs)
 
-    # Fast path (no SRT, no VAD)
-    if not make_srt and not use_vad:
-        # Build inputs with CPU audio; THEN move the full batch to device
-        model_inputs = build_processor_inputs(base_prompt, wav).to(MODEL_DEVICE)
-        outputs = model.generate(**model_inputs)
-        num_input_tokens = model_inputs["input_ids"].shape[-1]
-        new_tokens = outputs[:, num_input_tokens:]
-        text = tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)[0].strip()
-        t1 = time.time()
-        return {
-            "status": "ok",
-            "text": text,
-            "timings": {"load_seconds": round(LOAD_T1 - LOAD_T0, 3), "inference_seconds": round(t1 - t0, 3)},
-            "meta": {
-                "device": str(MODEL_DEVICE), "dtype": str(TORCH_DTYPE), "sr_hz": SR_TARGET,
-                "task": task, "model_id": MODEL_ID, "audio_seconds": round(total_seconds, 3),
-                "download_caps_sec": {"youtube_predownload": predownload_cap_sec},
-                "tokens": {"prompt_tokens": int(num_input_tokens), "new_tokens": int(new_tokens.shape[-1])}
-            }
-        }
-
     # Spans (VAD or fixed windows)
     if use_vad:
         spans = make_vad_spans(
@@ -739,43 +715,58 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     else:
         spans = _make_chunks(n_samples, SR_TARGET, CHUNK_SECONDS, CHUNK_OVERLAP)
 
-    # Transcribe spans + optional SRT
-    full_text_parts: List[str] = []
+    # Transcribe spans + SRT (split long text so SRT matches `text`) with overlap de-dupe
+    joined_text = ""
+    prev_tail = ""
     srt_entries: List[str] = []
     srt_index = 1
     total_new_tokens = 0
 
     for (st, en) in spans:
-        clip = wav[:, st:en]  # keep on CPU for processor
-        txt, new_tok = transcribe_clip(base_prompt, clip)
+        clip = wav[:, st:en]
+        raw_txt, new_tok = transcribe_clip(base_prompt, clip)
         total_new_tokens += new_tok
-        full_text_parts.append(txt)
 
+        # De-dup overlap (caused by chunk overlap or VAD padding)
+        txt = _trim_prefix_overlap(prev_tail, raw_txt)
+        if not txt.strip():
+            continue  # skip pure duplicates
+
+        # Accumulate plain text and update tail (keep last ~120 chars)
+        joined_text = (joined_text + (" " if joined_text else "") + txt).strip()
+        prev_tail = joined_text[-120:]
+
+        # Build SRT (split long text; distribute time proportionally within span)
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
-        # Split long text to ensure SRT contains all words, not just 2 lines
         max_chars_per_cue = SRT_MAX_CHARS_PER_LINE * SRT_MAX_LINES
         pieces = _split_text_even(txt, max_chars_per_cue)
         total_chars = sum(len(p) for p in pieces) or 1
         cursor = start_sec
         for i, p in enumerate(pieces):
-            # Distribute segment time proportional to chars
             dur = (end_sec - start_sec) * (len(p) / total_chars)
             st_s = cursor
             en_s = end_sec if i == len(pieces) - 1 else min(end_sec, cursor + dur)
             block = _wrap_lines(p, SRT_MAX_CHARS_PER_LINE, SRT_MAX_LINES)
             srt_entries.append(f"{srt_index}\n{_sec_to_srt_ts(st_s)} --> {_sec_to_srt_ts(en_s)}\n{block}\n")
-
             srt_index += 1
             cursor = en_s
 
-    joined_text = " ".join([t for t in full_text_parts if t]).strip()
     srt_text = "\n".join(srt_entries).strip() if (spans and (make_srt or use_vad)) else None
 
     wrote_path, srt_b64 = None, None
     if srt_text and srt_path:
         if srt_path.startswith(("/", "./")):
             raise RuntimeError("Local file output is disabled. Provide a MinIO path like 'minio://bucket/key' or 'bucket/key'.")
-        minio_write_bytes(srt_path, srt_text.encode("utf-8"), content_type="application/x-subrip")
+        try:
+            minio_write_bytes(srt_path, srt_text.encode("utf-8"), content_type="application/x-subrip")
+        except Exception as e:
+            b, k = _parse_minio_path(srt_path)
+            trailing = " (NOTE: key ends with '/', looks like a folder)" if k.endswith("/") else ""
+            raise RuntimeError(
+                f"S3 PUT failed: endpoint={MINIO_ENDPOINT}, bucket={b}, key={k}{trailing}. "
+                f"Ensure your Backblaze app key has Write/List Files and the correct file-name prefix (if any). "
+                f"Original error: {e}"
+            ) from e
         b, k = _parse_minio_path(srt_path)
         wrote_path = f"minio://{b}/{k}"
     if srt_text and (make_srt and bool(return_srt_b64)):
@@ -784,7 +775,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     t1 = time.time()
     return {
         "status": "ok",
-        "text": joined_text,
+        "text": joined_text.strip(),
         "srt": srt_text,
         "srt_base64": srt_b64,
         "srt_path_written": wrote_path,
