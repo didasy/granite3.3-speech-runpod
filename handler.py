@@ -526,40 +526,24 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
     return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
 # ============================================================
-# Processor input builder (fixes sampling_rate error & CPU audio)
+# Processor input builder (Granite-safe)
 # ============================================================
 def build_processor_inputs(prompt_text: str, wav_clip: torch.Tensor):
     """
-    Returns a dict ready for model.generate(**inputs).
-    Tries processor(text=..., audio=...) first, then falls back safely.
-    Ensures audio is 1-D float32 on CPU for the feature extractor.
+    Granite Speech expects 16k mono audio as a torch.Tensor on CPU.
+    Call the processor directly with (text, audio); do NOT pass sampling_rate.
     """
-    audio_1d = wav_clip.squeeze(0).to(torch.float32).cpu().numpy()
-
-    # Try the common signature first
-    try:
-        return processor(text=prompt_text, audio=audio_1d,
-                         sampling_rate=SR_TARGET, return_tensors="pt")
-    except TypeError:
-        # Some processors expect 'audios' instead of 'audio'
-        try:
-            return processor(text=prompt_text, audios=audio_1d,
-                             sampling_rate=SR_TARGET, return_tensors="pt")
-        except TypeError:
-            # Final fallback: call FE + tokenizer separately
-            fe = processor.feature_extractor(audio_1d, sampling_rate=SR_TARGET, return_tensors="pt")
-            tk = tokenizer(prompt_text, return_tensors="pt")
-            fe.update(tk)
-            return fe
+    # Keep audio on CPU; Granite's processor validates shapes internally
+    audio_1d = wav_clip.squeeze(0).to(torch.float32).cpu()
+    return processor(prompt_text, audio_1d, return_tensors="pt")
 
 # ============================================================
 # Core inference (single clip)
 # ============================================================
 @torch.inference_mode()
 def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]:
-    # Build inputs (audio on CPU), then move to model device
-    model_inputs = build_processor_inputs(prompt_text, wav_clip)
-    model_inputs = {k: (v.to(MODEL_DEVICE) if hasattr(v, "to") else v) for k, v in model_inputs.items()}
+    # Build inputs (audio on CPU), then move the whole batch to model device
+    model_inputs = build_processor_inputs(prompt_text, wav_clip).to(MODEL_DEVICE)
     outputs = model.generate(**model_inputs)
     num_input_tokens = model_inputs["input_ids"].shape[-1]
     new_tokens = outputs[:, num_input_tokens:]
@@ -700,9 +684,8 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     # Fast path (no SRT, no VAD)
     if not make_srt and not use_vad:
-        # Build inputs with CPU audio; THEN move to device
-        model_inputs = build_processor_inputs(base_prompt, wav)  # wav is CPU tensor
-        model_inputs = {k: (v.to(MODEL_DEVICE) if hasattr(v, "to") else v) for k, v in model_inputs.items()}
+        # Build inputs with CPU audio; THEN move the full batch to device
+        model_inputs = build_processor_inputs(base_prompt, wav).to(MODEL_DEVICE)
         outputs = model.generate(**model_inputs)
         num_input_tokens = model_inputs["input_ids"].shape[-1]
         new_tokens = outputs[:, num_input_tokens:]
