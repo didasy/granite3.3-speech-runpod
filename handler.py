@@ -1,4 +1,4 @@
-import os, re, io, time, json, shutil, tempfile, subprocess, base64
+import os, re, io, time, json, shutil, tempfile, subprocess, base64, math
 from typing import Dict, Any, Tuple, Optional, List
 from urllib.parse import urlparse
 
@@ -65,6 +65,11 @@ VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "300"))
 VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
 VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
 VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
+
+# Non-speech gating (to avoid hallucinating words over music/silence)
+MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.35"))   # 0.30–0.45 typical
+MIN_RMS_DBFS     = float(os.getenv("MIN_RMS_DBFS", "-45"))        # music/ambience often < -45 dBFS
+TAG_NON_SPEECH   = os.getenv("TAG_NON_SPEECH", "false").lower() == "true"
 
 # hf_transfer fail-safe
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
@@ -204,16 +209,9 @@ def minio_write_bytes(path: str, data: bytes, content_type: str = "application/o
 def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, int]:
     """
     yt_opts keys (all optional):
-      - cookies_b64: base64 of Netscape cookies.txt
-      - cookies_text: raw Netscape cookies file content (string)
-      - cookie_path: MinIO path "minio://bucket/key" or "bucket/key"
-      - proxy: e.g. "http://user:pass@host:8080"
-      - geo_country: e.g. "US"
-      - user_agent: UA string
-      - accept_language: e.g. "en-US,en;q=0.8"
-      - player_clients: list like ["android","web"]
-      - no_check_cert: bool
-      - format: yt-dlp format string (defaults to env YTDLP_FORMAT)
+      - cookies_b64 / cookies_text / cookie_path
+      - proxy, geo_country, user_agent, accept_language
+      - player_clients, no_check_cert, format
     """
     import yt_dlp
 
@@ -314,10 +312,7 @@ def load_audio(
     youtube_opts: Optional[Dict[str, Any]] = None
 ) -> Tuple[torch.Tensor, int]:
     """
-    Accepts:
-      - dict: {"type": "url"|"base64"|"path"|"data_url", "value": "..."}
-      - str: url | data_url | base64 | YouTube
-    'path' values are treated as MinIO paths ONLY. Local filesystem is blocked for user data.
+    Accepts dict or str. 'path' values are MinIO paths ONLY.
     """
     def is_data_url(s: str) -> bool:
         return s.startswith("data:audio") and ";base64," in s
@@ -373,7 +368,7 @@ def resample_and_mono(wav: torch.Tensor, sr: int) -> torch.Tensor:
     return wav
 
 # ============================================================
-# VAD utilities
+# VAD + gating utilities
 # ============================================================
 def _float_to_pcm16_bytes(wav: torch.Tensor) -> bytes:
     x = wav.squeeze(0).clamp_(-1.0, 1.0)
@@ -454,6 +449,23 @@ def make_vad_spans(
         spans = [(0, wav.shape[-1])]
     return spans
 
+def _rms_dbfs(wav_clip: torch.Tensor) -> float:
+    x = wav_clip.to(torch.float32).squeeze(0)
+    rms = torch.sqrt(torch.clamp((x * x).mean(), min=1e-12)).item()
+    return 20.0 * math.log10(rms + 1e-12)
+
+def _speech_ratio(wav_clip: torch.Tensor, frame_ms: int = VAD_FRAME_MS, aggr: int = VAD_AGGRESSIVENESS) -> float:
+    vad = webrtcvad.Vad(aggr)
+    pcm = _float_to_pcm16_bytes(wav_clip.to(torch.float32))
+    frames = list(_frames_from_pcm16(pcm, SR_TARGET, frame_ms))
+    if not frames:
+        return 0.0
+    speech = 0
+    for _, fb in frames:
+        if vad.is_speech(fb, SR_TARGET):
+            speech += 1
+    return speech / max(1, len(frames))
+
 # ============================================================
 # SRT helpers
 # ============================================================
@@ -498,7 +510,6 @@ def _make_chunks(n_samples: int, sr: int, chunk_s: float, overlap_s: float) -> L
             break
     return spans
 
-# Split long text into multiple SRT cues so SRT matches full text
 def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
     if len(text) <= max_chars_per_cue:
         return [text]
@@ -516,7 +527,6 @@ def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
         parts.append(cur)
     return parts
 
-# De-duplicate overlap between adjacent chunk transcripts
 def _trim_prefix_overlap(prev_tail: str, new_text: str, max_overlap: int = 80, min_overlap: int = 12) -> str:
     prev_tail = (prev_tail or "")[-max_overlap:]
     new_text = new_text or ""
@@ -543,7 +553,8 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
             tgt = (target_lang or "EN").upper()
             user = f"<|audio|>Please translate the speech from {src} to {tgt}."
         else:
-            user = "<|audio|>Please transcribe the speech verbatim."
+            # You can pass your own stricter prompt in the request to suppress hallucinations.
+            user = "<|audio|>Transcribe only spoken words. If there is music or silence, write [music] or [silence]. Do not invent words."
     else:
         user = prompt if prompt.strip().startswith("<|audio|>") else f"<|audio|>{prompt.strip()}"
     chat = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}]
@@ -715,7 +726,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     else:
         spans = _make_chunks(n_samples, SR_TARGET, CHUNK_SECONDS, CHUNK_OVERLAP)
 
-    # Transcribe spans + SRT (split long text so SRT matches `text`) with overlap de-dupe
+    # Transcribe spans + SRT with overlap de-dupe and non-speech gating
     joined_text = ""
     prev_tail = ""
     srt_entries: List[str] = []
@@ -724,6 +735,21 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     for (st, en) in spans:
         clip = wav[:, st:en]
+
+        # --- Non-speech gating (skip or tag) ---
+        ratio = _speech_ratio(clip)
+        dbfs  = _rms_dbfs(clip)
+        is_non_speechy = (ratio < MIN_SPEECH_RATIO and dbfs < MIN_RMS_DBFS)
+        if is_non_speechy:
+            if make_srt and TAG_NON_SPEECH:
+                label = "[music]" if dbfs < -40 else "[silence]"
+                srt_entries.append(
+                    f"{srt_index}\n{_sec_to_srt_ts(st / SR_TARGET)} --> {_sec_to_srt_ts(en / SR_TARGET)}\n{label}\n"
+                )
+                srt_index += 1
+            continue
+        # --- end gating ---
+
         raw_txt, new_tok = transcribe_clip(base_prompt, clip)
         total_new_tokens += new_tok
 
@@ -732,11 +758,11 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         if not txt.strip():
             continue  # skip pure duplicates
 
-        # Accumulate plain text and update tail (keep last ~120 chars)
+        # Accumulate plain text and update tail
         joined_text = (joined_text + (" " if joined_text else "") + txt).strip()
         prev_tail = joined_text[-120:]
 
-        # Build SRT (split long text; distribute time proportionally within span)
+        # Build SRT (split to fit line constraints; distribute time proportionally)
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
         max_chars_per_cue = SRT_MAX_CHARS_PER_LINE * SRT_MAX_LINES
         pieces = _split_text_even(txt, max_chars_per_cue)
@@ -790,6 +816,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
                 "min_speech_ms": VAD_MIN_SPEECH_MS, "max_silence_ms": VAD_MAX_SILENCE_MS,
                 "pad_ms": VAD_PAD_MS, "max_segment_s": VAD_MAX_SEGMENT_SECONDS
             },
+            "gating": {"min_speech_ratio": MIN_SPEECH_RATIO, "min_rms_dbfs": MIN_RMS_DBFS, "tag_non_speech": TAG_NON_SPEECH},
             "tokens": {"new_tokens_sum": total_new_tokens}
         }
     }
