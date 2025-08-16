@@ -5,25 +5,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/weights/huggingface \
     HUGGINGFACE_HUB_CACHE=/weights/huggingface \
-    TRANSFORMERS_CACHE=/weights/huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TOKENIZERS_PARALLELISM=false \
     PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
     MODEL_ID=ibm-granite/granite-speech-3.3-8b
 
-# System deps for audio/video
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg libsndfile1 ca-certificates wget \
  && rm -rf /var/lib/apt/lists/*
 
-# Install vision/audio matching Torch 2.6.0 CUDA 12.6
+# Match Torch 2.6.0 + CUDA 12.6
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu126 \
       "torchvision==0.21.0" "torchaudio==2.6.0"
 
-# Python deps (NOTE: do NOT reinstall torchaudio here)
+# Python deps (note: no second 'torchaudio' here)
 RUN pip install --upgrade --no-cache-dir \
       "transformers>=4.52.4" peft soundfile accelerate pillow \
-      huggingface_hub runpod requests yt-dlp webrtcvad-wheels minio
+      huggingface_hub hf_transfer runpod requests yt-dlp webrtcvad-wheels minio
 
 WORKDIR /app
 COPY handler.py /app/handler.py
