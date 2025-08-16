@@ -13,12 +13,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System deps for audio/video
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg libsndfile1 git ca-certificates wget \
+      ffmpeg libsndfile1 ca-certificates wget \
  && rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Install vision/audio matching Torch 2.6.0 CUDA 12.6
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu126 \
+      "torchvision==0.21.0" "torchaudio==2.6.0"
+
+# Python deps (NOTE: do NOT reinstall torchaudio here)
 RUN pip install --upgrade --no-cache-dir \
-      "transformers>=4.52.4" torchaudio peft soundfile accelerate \
+      "transformers>=4.52.4" peft soundfile accelerate pillow \
       huggingface_hub runpod requests yt-dlp webrtcvad-wheels minio
 
 WORKDIR /app
