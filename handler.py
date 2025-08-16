@@ -1,75 +1,90 @@
-import base64, io, os, re, time, json, shutil, tempfile, subprocess
+import os, re, io, time, json, shutil, tempfile, subprocess, base64
 from typing import Dict, Any, Tuple, Optional, List
-import torch, torchaudio, soundfile as sf, requests, runpod, webrtcvad
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 from urllib.parse import urlparse
+
+import torch
+import torchaudio
+import soundfile as sf
+import requests
+import runpod
+import webrtcvad
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 from minio import Minio
 
-# ---------------------------
-# Config via env
-# ---------------------------
+# ============================================================
+# Environment / config
+# ============================================================
 MODEL_ID = os.getenv("MODEL_ID", "ibm-granite/granite-speech-3.3-8b")
 
+# Sample rate & mono
 SR_TARGET = 16000
 MONO_CH = 1
 
-# Fixed-window chunking (fallback when VAD off)
+# Fixed-window chunking (when VAD is off)
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "20"))
 CHUNK_OVERLAP = float(os.getenv("CHUNK_OVERLAP", "1"))
-MAX_DURATION_SECONDS = float(os.getenv("MAX_DURATION_SECONDS", "0"))  # legacy seconds cap (0 = off)
+# Legacy hard seconds cap (0 = off)
+MAX_DURATION_SECONDS = float(os.getenv("MAX_DURATION_SECONDS", "0"))
 
 # Global cap in minutes (+ action)
-MAX_INPUT_MINUTES = float(os.getenv("MAX_INPUT_MINUTES", "0"))       # 0 = off
-MAX_INPUT_ACTION  = os.getenv("MAX_INPUT_ACTION", "reject").lower()  # "reject" | "truncate"
+MAX_INPUT_MINUTES = float(os.getenv("MAX_INPUT_MINUTES", "0"))  # 0 = off
+MAX_INPUT_ACTION = os.getenv("MAX_INPUT_ACTION", "reject").lower()  # "reject" | "truncate"
 
-# NEW: YouTube download-time cap (minutes)
-MAX_YOUTUBE_MINUTES = float(os.getenv("MAX_YOUTUBE_MINUTES", "0"))   # 0 = off
-
-# VAD controls
-USE_VAD_DEFAULT = os.getenv("USE_VAD_DEFAULT", "false").lower() == "true"
-VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "2"))  # 0..3
-VAD_FRAME_MS = int(os.getenv("VAD_FRAME_MS", "30"))             # 10/20/30
-VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "300"))
-VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
-VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
-VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
+# YouTube pre-download cap (minutes)
+MAX_YOUTUBE_MINUTES = float(os.getenv("MAX_YOUTUBE_MINUTES", "0"))  # 0 = off
 
 # SRT formatting
 SRT_MAX_CHARS_PER_LINE = int(os.getenv("SRT_MAX_CHARS_PER_LINE", "42"))
 SRT_MAX_LINES = int(os.getenv("SRT_MAX_LINES", "2"))
 RETURN_SRT_BASE64_DEFAULT = os.getenv("RETURN_SRT_BASE64_DEFAULT", "true").lower() == "true"
 
-# YouTube
+# YouTube base opts
 YTDLP_FORMAT = os.getenv("YTDLP_FORMAT", "bestaudio/best")
 YTDLP_RETRIES = int(os.getenv("YTDLP_RETRIES", "3"))
 
-# MinIO (S3 compatible) — used whenever "type":"path" is provided
-MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT")   # e.g. "minio.yourdomain:9000"
-MINIO_SECURE     = os.getenv("MINIO_SECURE", "true").lower() == "true"
+# MinIO (S3 compatible) — used for "type":"path" and SRT writes
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")    # e.g. "minio.yourdomain:9000"
+MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 
-# Optional defaults for path shorthand & default SRT location
-MINIO_INPUT_BUCKET  = os.getenv("MINIO_INPUT_BUCKET")   # e.g. "media"
-MINIO_INPUT_PREFIX  = os.getenv("MINIO_INPUT_PREFIX", "")  # e.g. "in/"
-MINIO_OUTPUT_BUCKET = os.getenv("MINIO_OUTPUT_BUCKET")  # e.g. "media"
+# Optional defaults for shorthand
+MINIO_INPUT_BUCKET = os.getenv("MINIO_INPUT_BUCKET")
+MINIO_INPUT_PREFIX = os.getenv("MINIO_INPUT_PREFIX", "")
+MINIO_OUTPUT_BUCKET = os.getenv("MINIO_OUTPUT_BUCKET")
 MINIO_OUTPUT_PREFIX = os.getenv("MINIO_OUTPUT_PREFIX", "out/")
 
-# Disable local filesystem access entirely
+# Disable local user file access (temp files for yt/ffmpeg are still used)
 DISABLE_LOCAL_IO = True
 
-# ---------------------------
+# VAD controls
+USE_VAD_DEFAULT = os.getenv("USE_VAD_DEFAULT", "false").lower() == "true"
+VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "2"))  # 0..3
+VAD_FRAME_MS = int(os.getenv("VAD_FRAME_MS", "30"))             # 10|20|30
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "300"))
+VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
+VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
+VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
+
+# hf_transfer fail-safe: if env enabled but package missing, disable to avoid crash
+if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
+    try:
+        import hf_transfer  # noqa: F401
+    except Exception:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+# ============================================================
 # Device / dtype
-# ---------------------------
+# ============================================================
 if torch.cuda.is_available():
     major_cc, _ = torch.cuda.get_device_capability(0)
     TORCH_DTYPE = torch.bfloat16 if major_cc >= 8 else torch.float16
 else:
     TORCH_DTYPE = torch.float32
 
-# ---------------------------
-# Load model (cold start)
-# ---------------------------
+# ============================================================
+# Model load (cold start)
+# ============================================================
 LOAD_T0 = time.time()
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 tokenizer = processor.tokenizer
@@ -80,76 +95,61 @@ model.eval()
 MODEL_DEVICE = model.get_input_embeddings().weight.device
 LOAD_T1 = time.time()
 
-# ---------------------------
+# ============================================================
 # Helpers: YouTube & ffmpeg
-# ---------------------------
+# ============================================================
 YOUTUBE_RX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", re.IGNORECASE)
-def _is_youtube_url(url: str) -> bool: return bool(YOUTUBE_RX.match(url or ""))
+def _is_youtube_url(url: str) -> bool:
+    return bool(YOUTUBE_RX.match(url or ""))
 
 def _run_ffmpeg_to_wav(in_path: str, out_path: str, sr: int = SR_TARGET) -> None:
-    cmd = ["ffmpeg","-y","-hide_banner","-loglevel","error","-i",in_path,"-vn","-ac",str(MONO_CH),"-ar",str(sr),"-f","wav",out_path]
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", in_path, "-vn", "-ac", str(MONO_CH), "-ar", str(sr), "-f", "wav", out_path
+    ]
     subprocess.run(cmd, check=True)
 
 def _bytes_to_tempfile(raw: bytes, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as f: f.write(raw)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
     return path
 
 def _read_wav_bytes(raw_wav: bytes) -> Tuple[torch.Tensor, int]:
     data, sr = sf.read(io.BytesIO(raw_wav), always_2d=False)
-    if data.ndim == 2: data = data.T
+    if data.ndim == 2:
+        data = data.T
     wav = torch.tensor(data, dtype=torch.float32)
-    if wav.ndim == 1: wav = wav.unsqueeze(0)
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
     return wav, sr
 
 def _decode_with_ffmpeg_bytes(raw: bytes) -> Tuple[torch.Tensor, int]:
-    tmp_in = _bytes_to_tempfile(raw, suffix=".bin"); tmp_out_path = None
+    tmp_in = _bytes_to_tempfile(raw, suffix=".bin")
+    tmp_out_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
             tmp_out_path = tmp_out.name
         _run_ffmpeg_to_wav(tmp_in, tmp_out_path, sr=SR_TARGET)
-        with open(tmp_out_path, "rb") as f: raw_wav = f.read()
+        with open(tmp_out_path, "rb") as f:
+            raw_wav = f.read()
         return _read_wav_bytes(raw_wav)
     finally:
         for p in (tmp_in, tmp_out_path):
             try:
-                if p: os.remove(p)
+                if p:
+                    os.remove(p)
             except Exception:
                 pass
 
 def _download(url: str) -> bytes:
-    r = requests.get(url, timeout=180); r.raise_for_status(); return r.content
+    r = requests.get(url, timeout=180)
+    r.raise_for_status()
+    return r.content
 
-def _load_from_youtube(url: str, cap_seconds: Optional[float]) -> Tuple[torch.Tensor, int]:
-    import yt_dlp
-    tmpdir = tempfile.mkdtemp()
-    try:
-        wav_path = os.path.join(tmpdir, "audio.wav")
-        ydl_opts = {
-            "format": YTDLP_FORMAT,
-            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-            "noplaylist": True, "quiet": True, "no_warnings": True, "retries": YTDLP_RETRIES,
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
-            "postprocessor_args": ["-ar", str(SR_TARGET), "-ac", str(MONO_CH)],
-        }
-        # Hard-cap how much we download from YouTube
-        if cap_seconds and cap_seconds > 0:
-            # download only [0, cap_seconds]
-            ydl_opts["download_sections"] = {"*": [{"start_time": 0, "end_time": float(cap_seconds)}]}
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            candidate_wav = os.path.join(tmpdir, f"{info['id']}.wav")
-            _run_ffmpeg_to_wav(candidate_wav, wav_path, sr=SR_TARGET)
-
-        with open(wav_path, "rb") as f: raw_wav = f.read()
-        return _read_wav_bytes(raw_wav)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ---------------------------
+# ============================================================
 # MinIO helpers
-# ---------------------------
+# ============================================================
 def _minio_client() -> Minio:
     if not (MINIO_ENDPOINT and MINIO_ACCESS_KEY and MINIO_SECRET_KEY):
         raise RuntimeError("MinIO not configured: set MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY.")
@@ -161,6 +161,7 @@ def _parse_minio_path(path: str) -> Tuple[str, str]:
       - minio://bucket/key
       - s3://bucket/key  (treated same)
       - bucket/key       (shorthand)
+      - key (shorthand if MINIO_INPUT_BUCKET is set)
     """
     if path.startswith(("minio://", "s3://")):
         u = urlparse(path)
@@ -168,14 +169,13 @@ def _parse_minio_path(path: str) -> Tuple[str, str]:
         key = u.path.lstrip("/")
     else:
         parts = path.split("/", 1)
-        if len(parts) != 2:
-            if MINIO_INPUT_BUCKET:
-                bucket = MINIO_INPUT_BUCKET
-                key = (MINIO_INPUT_PREFIX or "") + path
-            else:
-                raise ValueError("Path must be 'minio://bucket/key', 's3://bucket/key', or 'bucket/key'.")
-        else:
+        if len(parts) == 2:
             bucket, key = parts
+        else:
+            if not MINIO_INPUT_BUCKET:
+                raise ValueError("Path must be 'minio://bucket/key', 's3://bucket/key', or 'bucket/key'.")
+            bucket = MINIO_INPUT_BUCKET
+            key = (MINIO_INPUT_PREFIX or "") + path
     if not bucket or not key:
         raise ValueError(f"Invalid MinIO path: {path}")
     return bucket, key
@@ -195,25 +195,128 @@ def minio_write_bytes(path: str, data: bytes, content_type: str = "application/o
     b, k = _parse_minio_path(path)
     client.put_object(b, k, io.BytesIO(data), length=len(data), content_type=content_type)
 
-# ---------------------------
-# Audio I/O (local FS disabled)
-# ---------------------------
+# ============================================================
+# YouTube loader with request-supplied cookies/proxy/geo/etc.
+# ============================================================
+def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, int]:
+    """
+    yt_opts keys (all optional):
+      - cookies_b64: base64 of Netscape cookies.txt
+      - cookies_text: raw Netscape cookies file content (string)
+      - cookie_path: MinIO path "minio://bucket/key" or "bucket/key" to cookies.txt
+      - proxy: e.g. "http://user:pass@host:8080"
+      - geo_country: e.g. "US"
+      - user_agent: UA string
+      - accept_language: e.g. "en-US,en;q=0.8"
+      - player_clients: list like ["android","web"]
+      - no_check_cert: bool
+      - format: yt-dlp format string (defaults to env YTDLP_FORMAT)
+    """
+    import yt_dlp
+
+    yt_opts = yt_opts or {}
+    cookie_tmp = None
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # Cookies precedence: b64 > inline text > minio path
+        cookies_b64: Optional[str] = yt_opts.get("cookies_b64")
+        cookies_text: Optional[str] = yt_opts.get("cookies_text")
+        cookie_path: Optional[str] = yt_opts.get("cookie_path")
+
+        if cookies_b64:
+            raw = base64.b64decode(cookies_b64)
+            cookie_tmp = _bytes_to_tempfile(raw, ".cookies.txt")
+        elif cookies_text:
+            cookie_tmp = _bytes_to_tempfile(cookies_text.encode("utf-8"), ".cookies.txt")
+        elif cookie_path:
+            raw = minio_read_bytes(cookie_path)
+            cookie_tmp = _bytes_to_tempfile(raw, ".cookies.txt")
+
+        headers = {
+            "User-Agent": yt_opts.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": yt_opts.get("accept_language") or "en-US,en;q=0.8",
+        }
+
+        extractor_args = {"youtube": {"player_client": yt_opts.get("player_clients") or ["android", "web"]}}
+
+        # Write into tmpdir without chdir by using absolute outtmpl
+        outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        ydl_opts = {
+            "format": yt_opts.get("format") or YTDLP_FORMAT,
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": YTDLP_RETRIES,
+            "fragment_retries": 10,
+            "skip_unavailable_fragments": True,
+            "concurrent_fragment_downloads": 3,
+            "http_headers": headers,
+            "geo_bypass": True,
+            "geo_bypass_country": yt_opts.get("geo_country"),
+            "nocheckcertificate": bool(yt_opts.get("no_check_cert", False)),
+            "extractor_args": extractor_args,
+            "proxy": yt_opts.get("proxy"),
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}
+            ],
+            "postprocessor_args": ["-ar", str(SR_TARGET), "-ac", str(MONO_CH)],
+        }
+        if cookie_tmp:
+            ydl_opts["cookiefile"] = cookie_tmp
+        if cap_seconds and cap_seconds > 0:
+            ydl_opts["download_sections"] = {"*": [{"start_time": 0, "end_time": float(cap_seconds)}]}
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            candidate_wav = os.path.join(tmpdir, f"{info['id']}.wav")
+            wav_path = os.path.join(tmpdir, "audio.wav")
+            _run_ffmpeg_to_wav(candidate_wav, wav_path, sr=SR_TARGET)
+            with open(wav_path, "rb") as f:
+                raw_wav = f.read()
+        return _read_wav_bytes(raw_wav)
+    except Exception as e:
+        msg = str(e)
+        hint = ""
+        if "403" in msg or "Forbidden" in msg:
+            hint = (" YouTube returned 403. Provide cookies via request fields "
+                    "`yt_cookies_b64`, `yt_cookies_text`, or `yt_cookie_path`; "
+                    "optionally set `yt_proxy` and/or `yt_geo_country`.")
+        raise RuntimeError(f"YouTube download failed: {msg}.{hint}") from e
+    finally:
+        if cookie_tmp:
+            try:
+                os.remove(cookie_tmp)
+            except Exception:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ============================================================
+# Audio I/O (local user paths disabled)
+# ============================================================
 def _read_audio_from_bytes(raw: bytes) -> Tuple[torch.Tensor, int]:
     try:
         data, sr = sf.read(io.BytesIO(raw), always_2d=False)
-        if data.ndim == 2: data = data.T
+        if data.ndim == 2:
+            data = data.T
         wav = torch.tensor(data, dtype=torch.float32)
-        if wav.ndim == 1: wav = wav.unsqueeze(0)
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
         return wav, sr
     except Exception:
         return _decode_with_ffmpeg_bytes(raw)
 
-def load_audio(input_audio: Any, youtube_cap_seconds: Optional[float] = None) -> Tuple[torch.Tensor, int]:
+def load_audio(
+    input_audio: Any,
+    youtube_cap_seconds: Optional[float] = None,
+    youtube_opts: Optional[Dict[str, Any]] = None
+) -> Tuple[torch.Tensor, int]:
     """
     Accepts:
       - dict: {"type": "url"|"base64"|"path"|"data_url", "value": "..."}
       - str: url | data_url | base64 | YouTube
-    'path' values are treated as MinIO paths ONLY. Local filesystem is blocked.
+    'path' values are treated as MinIO paths ONLY. Local filesystem is blocked for user data.
     """
     def is_data_url(s: str) -> bool:
         return s.startswith("data:audio") and ";base64," in s
@@ -223,15 +326,17 @@ def load_audio(input_audio: Any, youtube_cap_seconds: Optional[float] = None) ->
         value = input_audio.get("value", "")
     else:
         value = str(input_audio)
-        if is_data_url(value): a_type = "data_url"
-        elif _is_youtube_url(value): a_type = "url"
-        elif value.startswith(("minio://","s3://")) or ("/" in value and not value.startswith(("http://","https://"))):
+        if is_data_url(value):
+            a_type = "data_url"
+        elif _is_youtube_url(value):
+            a_type = "url"
+        elif value.startswith(("minio://", "s3://")) or ("/" in value and not value.startswith(("http://", "https://"))):
             a_type = "path"
         else:
             a_type = "url"
 
     if a_type == "url" and _is_youtube_url(value):
-        return _load_from_youtube(value, youtube_cap_seconds)
+        return _load_from_youtube(value, youtube_cap_seconds, youtube_opts)
 
     if a_type == "url":
         raw = _download(value)
@@ -248,7 +353,6 @@ def load_audio(input_audio: Any, youtube_cap_seconds: Optional[float] = None) ->
         return _read_audio_from_bytes(raw)
 
     if a_type == "path":
-        # Local FS explicitly disabled
         if value.startswith(("/", "./")):
             raise RuntimeError("Local file access is disabled. Use MinIO paths like 'minio://bucket/key' or 'bucket/key'.")
         raw = minio_read_bytes(value)
@@ -259,14 +363,17 @@ def load_audio(input_audio: Any, youtube_cap_seconds: Optional[float] = None) ->
     raise ValueError(f"Unsupported audio type: {a_type}")
 
 def resample_and_mono(wav: torch.Tensor, sr: int) -> torch.Tensor:
-    if wav.dim() == 2 and wav.size(0) > 1: wav = wav.mean(dim=0, keepdim=True)
-    elif wav.dim() == 1: wav = wav.unsqueeze(0)
-    if sr != SR_TARGET: wav = torchaudio.functional.resample(wav, sr, SR_TARGET)
+    if wav.dim() == 2 and wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    elif wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    if sr != SR_TARGET:
+        wav = torchaudio.functional.resample(wav, sr, SR_TARGET)
     return wav
 
-# ---------------------------
+# ============================================================
 # VAD utilities
-# ---------------------------
+# ============================================================
 def _float_to_pcm16_bytes(wav: torch.Tensor) -> bytes:
     x = wav.squeeze(0).clamp_(-1.0, 1.0)
     return (x * 32767.0).to(torch.int16).cpu().numpy().tobytes()
@@ -277,11 +384,13 @@ def _frames_from_pcm16(pcm_bytes: bytes, sample_rate: int, frame_ms: int):
     offset, ts, step_sec = 0, 0.0, frame_ms / 1000.0
     while offset + frame_len <= len(pcm_bytes):
         yield (ts, pcm_bytes[offset:offset + frame_len])
-        offset += frame_len; ts += step_sec
+        offset += frame_len
+        ts += step_sec
 
 def _split_long_segments(seg: Tuple[float, float], max_len_s: float) -> List[Tuple[float, float]]:
     st, en = seg
-    if en - st <= max_len_s: return [seg]
+    if en - st <= max_len_s:
+        return [seg]
     spans, cur = [], st
     while cur < en:
         nxt = min(en, cur + max_len_s)
@@ -297,13 +406,16 @@ def make_vad_spans(
     vad = webrtcvad.Vad(aggressiveness)
     pcm = _float_to_pcm16_bytes(wav.to(torch.float32))
     frames = list(_frames_from_pcm16(pcm, sr, frame_ms))
-    if not frames: return []
+    if not frames:
+        return []
     min_speech_frames = max(1, int(round(min_speech_ms / frame_ms)))
     max_silence_frames = max(1, int(round(max_silence_ms / frame_ms)))
     pad_frames = int(round(pad_ms / frame_ms))
+
     segments: List[Tuple[float, float]] = []
     triggered, voiced_run, silence_run = False, 0, 0
     seg_start_ts = 0.0
+
     for ts, fb in frames:
         is_speech = vad.is_speech(fb, sr)
         if not triggered:
@@ -320,58 +432,74 @@ def make_vad_spans(
                 if silence_run >= max_silence_frames:
                     seg_end_ts = ts
                     seg_start = max(0.0, seg_start_ts - pad_frames * frame_ms / 1000.0)
-                    seg_end = min(len(pcm) / (2*sr), seg_end_ts + pad_frames * frame_ms / 1000.0)
+                    seg_end = min(len(pcm) / (2 * sr), seg_end_ts + pad_frames * frame_ms / 1000.0)
                     for st, en in _split_long_segments((seg_start, seg_end), max_segment_s):
                         segments.append((st, en))
                     triggered, silence_run = False, 0
+
     if triggered:
         seg_end_ts = len(pcm) / (2 * sr)
         seg_start = max(0.0, seg_start_ts - pad_frames * frame_ms / 1000.0)
-        seg_end = min(len(pcm) / (2*sr), seg_end_ts + pad_frames * frame_ms / 1000.0)
+        seg_end = min(len(pcm) / (2 * sr), seg_end_ts + pad_frames * frame_ms / 1000.0)
         for st, en in _split_long_segments((seg_start, seg_end), max_segment_s):
             segments.append((st, en))
+
     spans: List[Tuple[int, int]] = []
     for st, en in segments:
         s, e = int(st * sr), int(en * sr)
-        if e > s: spans.append((s, e))
-    if not spans: spans = [(0, wav.shape[-1])]
+        if e > s:
+            spans.append((s, e))
+    if not spans:
+        spans = [(0, wav.shape[-1])]
     return spans
 
-# ---------------------------
+# ============================================================
 # SRT helpers
-# ---------------------------
+# ============================================================
 def _sec_to_srt_ts(sec: float) -> str:
-    if sec < 0: sec = 0.0
+    if sec < 0:
+        sec = 0.0
     ms = int(round(sec * 1000))
-    h = ms // 3_600_000; ms %= 3_600_000
-    m = ms // 60_000;    ms %= 60_000
-    s = ms // 1000;      ms %= 1000
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def _wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
     words = text.strip().split()
     lines, cur = [], ""
     for w in words:
-        if not cur: cur = w
-        elif len(cur) + 1 + len(w) <= max_chars: cur += " " + w
-        else: lines.append(cur); cur = w
-    if cur: lines.append(cur)
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= max_chars:
+            cur += " " + w
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
     return "\n".join(lines[:max_lines])
 
 def _make_chunks(n_samples: int, sr: int, chunk_s: float, overlap_s: float) -> List[Tuple[int, int]]:
-    if chunk_s <= 0: return [(0, n_samples)]
+    if chunk_s <= 0:
+        return [(0, n_samples)]
     chunk = int(chunk_s * sr)
     step = max(1, int((chunk_s - max(0.0, overlap_s)) * sr))
     spans = []
     for st in range(0, n_samples, step):
         en = min(st + chunk, n_samples)
-        if en - st > 0: spans.append((st, en))
-        if en >= n_samples: break
+        if en - st > 0:
+            spans.append((st, en))
+        if en >= n_samples:
+            break
     return spans
 
-# ---------------------------
+# ============================================================
 # Prompt builder
-# ---------------------------
+# ============================================================
 def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], target_lang: Optional[str]) -> str:
     sys_prompt = (
         "Knowledge Cutoff Date: April 2024.\n"
@@ -387,12 +515,12 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
             user = "<|audio|>Please transcribe the speech verbatim."
     else:
         user = prompt if prompt.strip().startswith("<|audio|>") else f"<|audio|>{prompt.strip()}"
-    chat = [ {"role":"system","content":sys_prompt}, {"role":"user","content":user} ]
+    chat = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}]
     return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
-# ---------------------------
+# ============================================================
 # Core inference (single clip)
-# ---------------------------
+# ============================================================
 @torch.inference_mode()
 def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]:
     model_inputs = processor(prompt_text, wav_clip, sampling_rate=SR_TARGET, return_tensors="pt")
@@ -403,22 +531,28 @@ def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]
     text = tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)[0]
     return text.strip(), int(new_tokens.shape[-1])
 
-# ---------------------------
+# ============================================================
 # High-level entry
-# ---------------------------
+# ============================================================
 @torch.inference_mode()
 def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Input:
-      - audio: url | base64 | data_url | path (MinIO only) | YouTube URL
+    Input fields (selected):
+      - audio: url | data_url | base64 | path (MinIO only) | YouTube URL
       - task: "transcribe" | "translate"
+      - prompt, source_lang, target_lang
       - use_vad: bool
       - make_srt: bool
-      - srt_path: MinIO path only
+      - srt_path: MinIO path only (minio://bucket/key | bucket/key)
       - return_srt_base64: bool
-      - max_input_minutes: float (per-request override)
-      - max_input_action: "reject" | "truncate"
-      - max_youtube_minutes: float (per-request YT download cap)
+      - max_new_tokens, temperature, num_beams
+      - max_input_minutes: float; max_input_action: "reject"|"truncate"
+      - max_youtube_minutes: float (YT pre-download cap)
+      - yt_cookies_b64 | yt_cookies_text | yt_cookie_path (MinIO)
+      - yt_proxy, yt_geo_country, yt_user_agent, yt_accept_language
+      - yt_player_clients: list (e.g., ["android","web"])
+      - yt_no_check_cert: bool
+      - yt_format: str (yt-dlp format)
     """
     t0 = time.time()
 
@@ -431,7 +565,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     num_beams = int(event_input.get("num_beams", 1))
 
     make_srt = bool(event_input.get("make_srt", False))
-    srt_path = event_input.get("srt_path")  # MinIO path only
+    srt_path = event_input.get("srt_path")
     return_srt_b64 = bool(event_input.get("return_srt_base64", RETURN_SRT_BASE64_DEFAULT))
     use_vad = bool(event_input.get("use_vad", USE_VAD_DEFAULT))
 
@@ -443,33 +577,53 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     if "audio" not in event_input:
         raise ValueError("Missing 'audio' in input.")
 
-    # ---- Compute a pre-download YT cap (seconds) BEFORE loading audio ----
-    # Use the strictest positive among: req_yt, env YT, env/request input minutes, legacy seconds.
+    # Compute YT pre-download cap (seconds) BEFORE loading audio: strictest positive among all caps
     yt_caps_sec = []
     if req_yt_minutes not in (None, ""):
-        try: yt_caps_sec.append(float(req_yt_minutes) * 60.0)
-        except Exception: pass
-    if MAX_YOUTUBE_MINUTES > 0: yt_caps_sec.append(MAX_YOUTUBE_MINUTES * 60.0)
-    if MAX_INPUT_MINUTES > 0: yt_caps_sec.append(MAX_INPUT_MINUTES * 60.0)
+        try:
+            yt_caps_sec.append(float(req_yt_minutes) * 60.0)
+        except Exception:
+            pass
+    if MAX_YOUTUBE_MINUTES > 0:
+        yt_caps_sec.append(MAX_YOUTUBE_MINUTES * 60.0)
+    if MAX_INPUT_MINUTES > 0:
+        yt_caps_sec.append(MAX_INPUT_MINUTES * 60.0)
     if req_max_minutes not in (None, ""):
-        try: yt_caps_sec.append(float(req_max_minutes) * 60.0)
-        except Exception: pass
-    if MAX_DURATION_SECONDS > 0: yt_caps_sec.append(MAX_DURATION_SECONDS)
+        try:
+            yt_caps_sec.append(float(req_max_minutes) * 60.0)
+        except Exception:
+            pass
+    if MAX_DURATION_SECONDS > 0:
+        yt_caps_sec.append(MAX_DURATION_SECONDS)
     predownload_cap_sec = min(yt_caps_sec) if yt_caps_sec else None
 
-    # Auto SRT path on MinIO when requested
+    # Auto SRT path when requested but not provided
     if make_srt and not srt_path:
         if not MINIO_OUTPUT_BUCKET:
             raise RuntimeError("SRT requested but no MINIO_OUTPUT_BUCKET configured.")
         safe_name = f"granite_{int(time.time())}.srt"
         key = (MINIO_OUTPUT_PREFIX or "") + safe_name
-        srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"  # bare bucket/key form accepted
+        srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"  # bare bucket/key shorthand
 
-    # Load & normalize audio (pass YT cap to avoid over-downloading)
-    wav, sr0 = load_audio(event_input["audio"], youtube_cap_seconds=predownload_cap_sec)
+    # Gather request-level YT options and pass through
+    yt_req_opts = {
+        "cookies_b64":     event_input.get("yt_cookies_b64"),
+        "cookies_text":    event_input.get("yt_cookies_text"),
+        "cookie_path":     event_input.get("yt_cookie_path"),  # MinIO path or bucket/key
+        "proxy":           event_input.get("yt_proxy"),
+        "geo_country":     event_input.get("yt_geo_country"),
+        "user_agent":      event_input.get("yt_user_agent"),
+        "accept_language": event_input.get("yt_accept_language"),
+        "player_clients":  event_input.get("yt_player_clients"),
+        "no_check_cert":   event_input.get("yt_no_check_cert"),
+        "format":          event_input.get("yt_format"),
+    }
+
+    # Load & normalize audio (pass YT cap/options)
+    wav, sr0 = load_audio(event_input["audio"], youtube_cap_seconds=predownload_cap_sec, youtube_opts=yt_req_opts)
     wav = resample_and_mono(wav, sr0)
 
-    # ---- Enforce length limits (choose the strictest) after load ----
+    # Enforce overall length limits (strictest) AFTER load
     n_samples = wav.shape[-1]
     total_seconds = n_samples / SR_TARGET
 
@@ -483,8 +637,8 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
             limits.append(float(req_max_minutes) * 60.0)
         except Exception:
             pass
-
     apply_limit = min(limits) if limits else 0.0
+
     if apply_limit and total_seconds > apply_limit:
         if req_action == "truncate":
             wav = wav[:, : int(apply_limit * SR_TARGET)]
@@ -522,10 +676,10 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "ok",
             "text": text,
-            "timings": {"load_seconds": round(LOAD_T1-LOAD_T0,3), "inference_seconds": round(t1-t0,3)},
+            "timings": {"load_seconds": round(LOAD_T1 - LOAD_T0, 3), "inference_seconds": round(t1 - t0, 3)},
             "meta": {
                 "device": str(MODEL_DEVICE), "dtype": str(TORCH_DTYPE), "sr_hz": SR_TARGET,
-                "task": task, "model_id": MODEL_ID, "audio_seconds": round(total_seconds,3),
+                "task": task, "model_id": MODEL_ID, "audio_seconds": round(total_seconds, 3),
                 "download_caps_sec": {"youtube_predownload": predownload_cap_sec},
                 "tokens": {"prompt_tokens": int(num_input_tokens), "new_tokens": int(new_tokens.shape[-1])}
             }
@@ -579,10 +733,10 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         "srt": srt_text,
         "srt_base64": srt_b64,
         "srt_path_written": wrote_path,
-        "timings": {"load_seconds": round(LOAD_T1-LOAD_T0,3), "inference_seconds": round(t1-t0,3)},
+        "timings": {"load_seconds": round(LOAD_T1 - LOAD_T0, 3), "inference_seconds": round(t1 - t0, 3)},
         "meta": {
             "device": str(MODEL_DEVICE), "dtype": str(TORCH_DTYPE), "sr_hz": SR_TARGET,
-            "task": task, "model_id": MODEL_ID, "audio_seconds": round(total_seconds,3),
+            "task": task, "model_id": MODEL_ID, "audio_seconds": round(total_seconds, 3),
             "chunks": len(spans), "use_vad": use_vad,
             "download_caps_sec": {"youtube_predownload": predownload_cap_sec},
             "vad": {
@@ -594,9 +748,9 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         }
     }
 
-# ---------------------------
+# ============================================================
 # Runpod entry
-# ---------------------------
+# ============================================================
 def handler(event):
     try:
         payload = event.get("input") or {}
