@@ -66,10 +66,17 @@ VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
 VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
 VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
 
-# Non-speech gating (to avoid hallucinating words over music/silence)
-MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.35"))   # 0.30–0.45 typical
-MIN_RMS_DBFS     = float(os.getenv("MIN_RMS_DBFS", "-45"))        # music/ambience often < -45 dBFS
-TAG_NON_SPEECH   = os.getenv("TAG_NON_SPEECH", "false").lower() == "true"
+# Non-speech gating
+MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.40"))
+MIN_RMS_DBFS     = float(os.getenv("MIN_RMS_DBFS", "-45"))
+TAG_NON_SPEECH   = os.getenv("TAG_NON_SPEECH", "true").lower() == "true"
+
+# First-speech global detector + early stricter gating
+STRICT_FIRST_SPEECH = os.getenv("STRICT_FIRST_SPEECH", "true").lower() == "true"
+FIRST_SPEECH_MIN_CONSEC_MS = int(os.getenv("FIRST_SPEECH_MIN_CONSEC_MS", "1000"))   # require 1s continuous speech
+EARLY_SECS_STRICT = float(os.getenv("EARLY_SECS_STRICT", "12"))                     # stricter gating before N seconds
+EARLY_RATIO_BOOST = float(os.getenv("EARLY_RATIO_BOOST", "0.25"))                   # +25% ratio threshold early
+FIRST_SPEECH_PREPAD_MS = int(os.getenv("FIRST_SPEECH_PREPAD_MS", "80"))             # keep tiny pre-roll before first speech
 
 # hf_transfer fail-safe
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
@@ -466,6 +473,35 @@ def _speech_ratio(wav_clip: torch.Tensor, frame_ms: int = VAD_FRAME_MS, aggr: in
             speech += 1
     return speech / max(1, len(frames))
 
+def _detect_first_speech_sec(
+    wav: torch.Tensor,
+    sr: int,
+    aggr: int = max(3, VAD_AGGRESSIVENESS),
+    frame_ms: int = 20,
+    min_consec_ms: int = FIRST_SPEECH_MIN_CONSEC_MS,
+) -> float:
+    """
+    Scan with strict VAD; return timestamp where we first observe a run of
+    >= min_consec_ms continuous speech frames. Returns 0.0 if none.
+    """
+    vad = webrtcvad.Vad(aggr)
+    pcm = _float_to_pcm16_bytes(wav.to(torch.float32))
+    frames = list(_frames_from_pcm16(pcm, sr, frame_ms))
+    need = max(1, int(round(min_consec_ms / frame_ms)))
+    run = 0
+    start_ts = 0.0
+    for ts, fb in frames:
+        if vad.is_speech(fb, sr):
+            if run == 0:
+                start_ts = ts
+            run += 1
+            if run >= need:
+                prepad = FIRST_SPEECH_PREPAD_MS / 1000.0
+                return max(0.0, start_ts - prepad)
+        else:
+            run = 0
+    return 0.0
+
 # ============================================================
 # SRT helpers
 # ============================================================
@@ -553,8 +589,7 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
             tgt = (target_lang or "EN").upper()
             user = f"<|audio|>Please translate the speech from {src} to {tgt}."
         else:
-            # You can pass your own stricter prompt in the request to suppress hallucinations.
-            user = "<|audio|>Transcribe only spoken words. If there is music or silence, write [music] or [silence]. Do not invent words."
+            user = "<|audio|>Please transcribe the speech verbatim."
     else:
         user = prompt if prompt.strip().startswith("<|audio|>") else f"<|audio|>{prompt.strip()}"
     chat = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}]
@@ -564,10 +599,6 @@ def build_prompt(task: str, prompt: Optional[str], source_lang: Optional[str], t
 # Processor input builder (Granite-safe)
 # ============================================================
 def build_processor_inputs(prompt_text: str, wav_clip: torch.Tensor):
-    """
-    Granite Speech expects 16k mono audio as a torch.Tensor on CPU.
-    Call the processor directly with (text, audio); do NOT pass sampling_rate.
-    """
     audio_1d = wav_clip.squeeze(0).to(torch.float32).cpu()
     return processor(prompt_text, audio_1d, return_tensors="pt")
 
@@ -589,20 +620,6 @@ def transcribe_clip(prompt_text: str, wav_clip: torch.Tensor) -> Tuple[str, int]
 # ============================================================
 @torch.inference_mode()
 def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Input fields (selected):
-      - audio: url | data_url | base64 | path (MinIO only) | YouTube URL
-      - task: "transcribe" | "translate"
-      - prompt, source_lang, target_lang
-      - use_vad: bool
-      - make_srt: bool
-      - srt_path: MinIO path only (minio://bucket/key | bucket/key)
-      - return_srt_base64: bool
-      - max_new_tokens, temperature, num_beams
-      - max_input_minutes: float; max_input_action: "reject"|"truncate"
-      - max_youtube_minutes: float (YT pre-download cap)
-      - yt_* options (cookies, proxy, geo, user-agent, player_clients, format)
-    """
     t0 = time.time()
 
     task = (event_input.get("task") or "transcribe").lower()
@@ -726,6 +743,23 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     else:
         spans = _make_chunks(n_samples, SR_TARGET, CHUNK_SECONDS, CHUNK_OVERLAP)
 
+    # === Global first-speech guard: trim/drop spans before real speech ===
+    first_speech_sec = 0.0
+    if STRICT_FIRST_SPEECH:
+        first_speech_sec = _detect_first_speech_sec(
+            wav, SR_TARGET, aggr=max(3, VAD_AGGRESSIVENESS), frame_ms=20, min_consec_ms=FIRST_SPEECH_MIN_CONSEC_MS
+        )
+        if first_speech_sec > 0.0:
+            new_spans = []
+            for (st, en) in spans:
+                st_s, en_s = st / SR_TARGET, en / SR_TARGET
+                if en_s <= first_speech_sec:
+                    continue  # drop fully before first speech
+                if st_s < first_speech_sec:
+                    st = int(first_speech_sec * SR_TARGET)  # trim to the detected speech onset
+                new_spans.append((st, en))
+            spans = new_spans
+
     # Transcribe spans + SRT with overlap de-dupe and non-speech gating
     joined_text = ""
     prev_tail = ""
@@ -736,15 +770,17 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     for (st, en) in spans:
         clip = wav[:, st:en]
 
-        # --- Non-speech gating (skip or tag) ---
+        # --- Dynamic non-speech gating (stricter for early seconds) ---
+        start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
         ratio = _speech_ratio(clip)
         dbfs  = _rms_dbfs(clip)
-        is_non_speechy = (ratio < MIN_SPEECH_RATIO and dbfs < MIN_RMS_DBFS)
+        thr_ratio = MIN_SPEECH_RATIO * (1.0 + EARLY_RATIO_BOOST if end_sec <= EARLY_SECS_STRICT else 1.0)
+        is_non_speechy = (ratio < thr_ratio and dbfs < MIN_RMS_DBFS)
         if is_non_speechy:
             if make_srt and TAG_NON_SPEECH:
                 label = "[music]" if dbfs < -40 else "[silence]"
                 srt_entries.append(
-                    f"{srt_index}\n{_sec_to_srt_ts(st / SR_TARGET)} --> {_sec_to_srt_ts(en / SR_TARGET)}\n{label}\n"
+                    f"{srt_index}\n{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}\n{label}\n"
                 )
                 srt_index += 1
             continue
@@ -763,7 +799,6 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
         prev_tail = joined_text[-120:]
 
         # Build SRT (split to fit line constraints; distribute time proportionally)
-        start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
         max_chars_per_cue = SRT_MAX_CHARS_PER_LINE * SRT_MAX_LINES
         pieces = _split_text_even(txt, max_chars_per_cue)
         total_chars = sum(len(p) for p in pieces) or 1
@@ -790,7 +825,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
             trailing = " (NOTE: key ends with '/', looks like a folder)" if k.endswith("/") else ""
             raise RuntimeError(
                 f"S3 PUT failed: endpoint={MINIO_ENDPOINT}, bucket={b}, key={k}{trailing}. "
-                f"Ensure your Backblaze app key has Write/List Files and the correct file-name prefix (if any). "
+                f"Ensure the app key has Write/List Files and any name-prefix constraints are satisfied. "
                 f"Original error: {e}"
             ) from e
         b, k = _parse_minio_path(srt_path)
@@ -816,7 +851,12 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
                 "min_speech_ms": VAD_MIN_SPEECH_MS, "max_silence_ms": VAD_MAX_SILENCE_MS,
                 "pad_ms": VAD_PAD_MS, "max_segment_s": VAD_MAX_SEGMENT_SECONDS
             },
-            "gating": {"min_speech_ratio": MIN_SPEECH_RATIO, "min_rms_dbfs": MIN_RMS_DBFS, "tag_non_speech": TAG_NON_SPEECH},
+            "gating": {
+                "min_speech_ratio": MIN_SPEECH_RATIO, "min_rms_dbfs": MIN_RMS_DBFS,
+                "tag_non_speech": TAG_NON_SPEECH,
+                "strict_first_speech": STRICT_FIRST_SPEECH,
+                "first_speech_sec": round(first_speech_sec, 3) if STRICT_FIRST_SPEECH else 0.0
+            },
             "tokens": {"new_tokens_sum": total_new_tokens}
         }
     }
