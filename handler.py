@@ -20,7 +20,7 @@ MODEL_ID = os.getenv("MODEL_ID", "ibm-granite/granite-speech-3.3-8b")
 SR_TARGET = 16000
 MONO_CH = 1
 
-# Fixed-window chunking (when VAD is off)
+# Chunking (when VAD is off)
 CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "20"))
 CHUNK_OVERLAP = float(os.getenv("CHUNK_OVERLAP", "1"))
 # Legacy hard seconds cap (0 = off)
@@ -43,7 +43,7 @@ YTDLP_FORMAT = os.getenv("YTDLP_FORMAT", "bestaudio/best")
 YTDLP_RETRIES = int(os.getenv("YTDLP_RETRIES", "3"))
 
 # MinIO (S3 compatible)
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")    # e.g. "s3.us-east-005.backblazeb2.com"
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
@@ -66,17 +66,18 @@ VAD_MAX_SILENCE_MS = int(os.getenv("VAD_MAX_SILENCE_MS", "400"))
 VAD_PAD_MS = int(os.getenv("VAD_PAD_MS", "120"))
 VAD_MAX_SEGMENT_SECONDS = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "30"))
 
-# Non-speech gating
+# Universal non-speech gating
 MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.40"))
 MIN_RMS_DBFS     = float(os.getenv("MIN_RMS_DBFS", "-45"))
 TAG_NON_SPEECH   = os.getenv("TAG_NON_SPEECH", "true").lower() == "true"
 
-# First-speech global detector + early stricter gating
-STRICT_FIRST_SPEECH = os.getenv("STRICT_FIRST_SPEECH", "true").lower() == "true"
-FIRST_SPEECH_MIN_CONSEC_MS = int(os.getenv("FIRST_SPEECH_MIN_CONSEC_MS", "1000"))   # require 1s continuous speech
-EARLY_SECS_STRICT = float(os.getenv("EARLY_SECS_STRICT", "12"))                     # stricter gating before N seconds
-EARLY_RATIO_BOOST = float(os.getenv("EARLY_RATIO_BOOST", "0.25"))                   # +25% ratio threshold early
-FIRST_SPEECH_PREPAD_MS = int(os.getenv("FIRST_SPEECH_PREPAD_MS", "80"))             # keep tiny pre-roll before first speech
+# Consensus decoding (universal hallucination guard)
+CONSENSUS_DECODE   = os.getenv("CONSENSUS_DECODE", "true").lower() == "true"
+CONS_SHIFT_MS      = int(os.getenv("CONS_SHIFT_MS", "250"))           # +/- shift per extra pass
+CONS_MIN_VOTES     = int(os.getenv("CONS_MIN_VOTES", "2"))            # keep token/bigram if seen in >= this many decodes
+CONS_JACCARD_MIN   = float(os.getenv("CONS_JACCARD_MIN", "0.35"))     # if base vs variant bigrams jaccard < this and gating flags low-speech, drop
+CONS_MIN_KEEP_CH   = int(os.getenv("CONS_MIN_KEEP_CH", "4"))          # if filtered text shorter than this under low-speech, drop
+CONS_MAX_TOK_TAIL  = int(os.getenv("CONS_MAX_TOK_TAIL", "120"))       # context tail for overlap de-dupe
 
 # hf_transfer fail-safe
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
@@ -171,13 +172,6 @@ def _minio_client() -> Minio:
     return Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
 
 def _parse_minio_path(path: str) -> Tuple[str, str]:
-    """
-    Accept:
-      - minio://bucket/key
-      - s3://bucket/key  (treated same)
-      - bucket/key       (shorthand)
-      - key (shorthand if MINIO_INPUT_BUCKET is set)
-    """
     if path.startswith(("minio://", "s3://")):
         u = urlparse(path)
         bucket = u.netloc
@@ -214,23 +208,14 @@ def minio_write_bytes(path: str, data: bytes, content_type: str = "application/o
 # YouTube loader with cookies/proxy/geo/etc.
 # ============================================================
 def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, int]:
-    """
-    yt_opts keys (all optional):
-      - cookies_b64 / cookies_text / cookie_path
-      - proxy, geo_country, user_agent, accept_language
-      - player_clients, no_check_cert, format
-    """
     import yt_dlp
-
     yt_opts = yt_opts or {}
     cookie_tmp = None
     tmpdir = tempfile.mkdtemp()
     try:
-        # Cookies precedence: b64 > inline text > minio path
         cookies_b64: Optional[str] = yt_opts.get("cookies_b64")
         cookies_text: Optional[str] = yt_opts.get("cookies_text")
         cookie_path: Optional[str] = yt_opts.get("cookie_path")
-
         if cookies_b64:
             raw = base64.b64decode(cookies_b64)
             cookie_tmp = _bytes_to_tempfile(raw, ".cookies.txt")
@@ -241,13 +226,10 @@ def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional
             cookie_tmp = _bytes_to_tempfile(raw, ".cookies.txt")
 
         headers = {
-            "User-Agent": yt_opts.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "User-Agent": yt_opts.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept-Language": yt_opts.get("accept_language") or "en-US,en;q=0.8",
         }
-
         extractor_args = {"youtube": {"player_client": yt_opts.get("player_clients") or ["android", "web"]}}
-
         outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
         ydl_opts = {
             "format": yt_opts.get("format") or YTDLP_FORMAT,
@@ -265,9 +247,7 @@ def _load_from_youtube(url: str, cap_seconds: Optional[float], yt_opts: Optional
             "nocheckcertificate": bool(yt_opts.get("no_check_cert", False)),
             "extractor_args": extractor_args,
             "proxy": yt_opts.get("proxy"),
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}
-            ],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
             "postprocessor_args": ["-ar", str(SR_TARGET), "-ac", str(MONO_CH)],
         }
         if cookie_tmp:
@@ -313,17 +293,9 @@ def _read_audio_from_bytes(raw: bytes) -> Tuple[torch.Tensor, int]:
     except Exception:
         return _decode_with_ffmpeg_bytes(raw)
 
-def load_audio(
-    input_audio: Any,
-    youtube_cap_seconds: Optional[float] = None,
-    youtube_opts: Optional[Dict[str, Any]] = None
-) -> Tuple[torch.Tensor, int]:
-    """
-    Accepts dict or str. 'path' values are MinIO paths ONLY.
-    """
+def load_audio(input_audio: Any, youtube_cap_seconds: Optional[float] = None, youtube_opts: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, int]:
     def is_data_url(s: str) -> bool:
         return s.startswith("data:audio") and ";base64," in s
-
     if isinstance(input_audio, dict):
         a_type = input_audio.get("type", "url")
         value = input_audio.get("value", "")
@@ -337,24 +309,19 @@ def load_audio(
             a_type = "path"
         else:
             a_type = "url"
-
     if a_type == "url" and _is_youtube_url(value):
         return _load_from_youtube(value, youtube_cap_seconds, youtube_opts)
-
     if a_type == "url":
         raw = _download(value)
         if value.lower().endswith(".mp4"):
             return _decode_with_ffmpeg_bytes(raw)
         return _read_audio_from_bytes(raw)
-
     if a_type == "data_url":
         raw = base64.b64decode(value.split(",", 1)[1])
         return _read_audio_from_bytes(raw)
-
     if a_type == "base64":
         raw = base64.b64decode(value)
         return _read_audio_from_bytes(raw)
-
     if a_type == "path":
         if value.startswith(("/", "./")):
             raise RuntimeError("Local file access is disabled. Use MinIO paths like 'minio://bucket/key' or 'bucket/key'.")
@@ -362,7 +329,6 @@ def load_audio(
         if value.lower().endswith(".mp4"):
             return _decode_with_ffmpeg_bytes(raw)
         return _read_audio_from_bytes(raw)
-
     raise ValueError(f"Unsupported audio type: {a_type}")
 
 def resample_and_mono(wav: torch.Tensor, sr: int) -> torch.Tensor:
@@ -401,10 +367,7 @@ def _split_long_segments(seg: Tuple[float, float], max_len_s: float) -> List[Tup
         cur = nxt
     return spans
 
-def make_vad_spans(
-    wav: torch.Tensor, sr: int, aggressiveness: int, frame_ms: int,
-    min_speech_ms: int, max_silence_ms: int, pad_ms: int, max_segment_s: float
-) -> List[Tuple[int, int]]:
+def make_vad_spans(wav: torch.Tensor, sr: int, aggressiveness: int, frame_ms: int, min_speech_ms: int, max_silence_ms: int, pad_ms: int, max_segment_s: float) -> List[Tuple[int, int]]:
     assert sr == SR_TARGET, "VAD assumes 16kHz"
     vad = webrtcvad.Vad(aggressiveness)
     pcm = _float_to_pcm16_bytes(wav.to(torch.float32))
@@ -473,34 +436,65 @@ def _speech_ratio(wav_clip: torch.Tensor, frame_ms: int = VAD_FRAME_MS, aggr: in
             speech += 1
     return speech / max(1, len(frames))
 
-def _detect_first_speech_sec(
-    wav: torch.Tensor,
-    sr: int,
-    aggr: int = max(3, VAD_AGGRESSIVENESS),
-    frame_ms: int = 20,
-    min_consec_ms: int = FIRST_SPEECH_MIN_CONSEC_MS,
-) -> float:
-    """
-    Scan with strict VAD; return timestamp where we first observe a run of
-    >= min_consec_ms continuous speech frames. Returns 0.0 if none.
-    """
-    vad = webrtcvad.Vad(aggr)
-    pcm = _float_to_pcm16_bytes(wav.to(torch.float32))
-    frames = list(_frames_from_pcm16(pcm, sr, frame_ms))
-    need = max(1, int(round(min_consec_ms / frame_ms)))
-    run = 0
-    start_ts = 0.0
-    for ts, fb in frames:
-        if vad.is_speech(fb, sr):
-            if run == 0:
-                start_ts = ts
-            run += 1
-            if run >= need:
-                prepad = FIRST_SPEECH_PREPAD_MS / 1000.0
-                return max(0.0, start_ts - prepad)
-        else:
-            run = 0
-    return 0.0
+# ============================================================
+# Text utilities for consensus
+# ============================================================
+_WORD_RX = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+
+def _tok(s: str) -> List[str]:
+    return _WORD_RX.findall(s.lower())
+
+def _bigrams(tokens: List[str]) -> List[Tuple[str, str]]:
+    return list(zip(tokens, tokens[1:]))
+
+def _consensus_filter(base_text: str, variants: List[str], min_votes: int, jaccard_min: float) -> str:
+    base_toks = _tok(base_text)
+    if not variants:
+        return " ".join(base_toks)
+    var_tok_sets = [set(_tok(v)) for v in variants]
+    var_bi_sets = [set(_bigrams(_tok(v))) for v in variants]
+    base_bi = set(_bigrams(base_toks))
+
+    # token vote
+    keep = []
+    for i, w in enumerate(base_toks):
+        votes = 1  # base has it
+        for s in var_tok_sets:
+            if w in s:
+                votes += 1
+        # bigram vote (stronger)
+        bi_ok = False
+        if i + 1 < len(base_toks):
+            bi = (w, base_toks[i+1])
+            bv = 1 if bi in base_bi else 0
+            for bs in var_bi_sets:
+                if bi in bs:
+                    bv += 1
+            bi_ok = (bv >= min_votes)
+        if votes >= min_votes or bi_ok:
+            keep.append(w)
+
+    # if everything was filtered, try a softer check based on jaccard similarity
+    if not keep:
+        for bs in var_bi_sets:
+            inter = len(base_bi & bs)
+            union = max(1, len(base_bi | bs))
+            if inter / union >= jaccard_min:
+                return " ".join(base_toks)
+        return ""
+
+    return " ".join(keep)
+
+def _trim_prefix_overlap(prev_tail: str, new_text: str, max_overlap: int = 80, min_overlap: int = 12) -> str:
+    prev_tail = (prev_tail or "")[-max_overlap:]
+    new_text = new_text or ""
+    upper = min(len(prev_tail), len(new_text), max_overlap)
+    for k in range(upper, min_overlap - 1, -1):
+        a = prev_tail[-k:].strip().lower()
+        b = new_text[:k].strip().lower()
+        if a == b and a:
+            return new_text[k:].lstrip()
+    return new_text
 
 # ============================================================
 # SRT helpers
@@ -563,17 +557,6 @@ def _split_text_even(text: str, max_chars_per_cue: int) -> List[str]:
         parts.append(cur)
     return parts
 
-def _trim_prefix_overlap(prev_tail: str, new_text: str, max_overlap: int = 80, min_overlap: int = 12) -> str:
-    prev_tail = (prev_tail or "")[-max_overlap:]
-    new_text = new_text or ""
-    upper = min(len(prev_tail), len(new_text), max_overlap)
-    for k in range(upper, min_overlap - 1, -1):
-        a = prev_tail[-k:].strip().lower()
-        b = new_text[:k].strip().lower()
-        if a == b and a:
-            return new_text[k:].lstrip()
-    return new_text
-
 # ============================================================
 # Prompt builder
 # ============================================================
@@ -635,7 +618,6 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     return_srt_b64 = bool(event_input.get("return_srt_base64", RETURN_SRT_BASE64_DEFAULT))
     use_vad = bool(event_input.get("use_vad", USE_VAD_DEFAULT))
 
-    # Per-request caps
     req_max_minutes = event_input.get("max_input_minutes")
     req_action = (event_input.get("max_input_action") or MAX_INPUT_ACTION).lower()
     req_yt_minutes = event_input.get("max_youtube_minutes")
@@ -643,27 +625,20 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     if "audio" not in event_input:
         raise ValueError("Missing 'audio' in input.")
 
-    # Compute YT pre-download cap BEFORE loading audio
+    # Compute YT pre-download cap
     yt_caps_sec = []
     if req_yt_minutes not in (None, ""):
-        try:
-            yt_caps_sec.append(float(req_yt_minutes) * 60.0)
-        except Exception:
-            pass
-    if MAX_YOUTUBE_MINUTES > 0:
-        yt_caps_sec.append(MAX_YOUTUBE_MINUTES * 60.0)
-    if MAX_INPUT_MINUTES > 0:
-        yt_caps_sec.append(MAX_INPUT_MINUTES * 60.0)
+        try: yt_caps_sec.append(float(req_yt_minutes) * 60.0)
+        except Exception: pass
+    if MAX_YOUTUBE_MINUTES > 0: yt_caps_sec.append(MAX_YOUTUBE_MINUTES * 60.0)
+    if MAX_INPUT_MINUTES > 0: yt_caps_sec.append(MAX_INPUT_MINUTES * 60.0)
     if req_max_minutes not in (None, ""):
-        try:
-            yt_caps_sec.append(float(req_max_minutes) * 60.0)
-        except Exception:
-            pass
-    if MAX_DURATION_SECONDS > 0:
-        yt_caps_sec.append(MAX_DURATION_SECONDS)
+        try: yt_caps_sec.append(float(req_max_minutes) * 60.0)
+        except Exception: pass
+    if MAX_DURATION_SECONDS > 0: yt_caps_sec.append(MAX_DURATION_SECONDS)
     predownload_cap_sec = min(yt_caps_sec) if yt_caps_sec else None
 
-    # Auto SRT path when requested but not provided
+    # Auto SRT path when not provided
     if make_srt and not srt_path:
         if not MINIO_OUTPUT_BUCKET:
             raise RuntimeError("SRT requested but no MINIO_OUTPUT_BUCKET configured.")
@@ -672,9 +647,9 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
             prefix += "/"
         safe_name = f"granite_{int(time.time())}.srt"
         key = f"{prefix}{safe_name}"
-        srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"  # bare bucket/key shorthand
+        srt_path = f"{MINIO_OUTPUT_BUCKET}/{key}"
 
-    # Gather request-level YT options
+    # YT options
     yt_req_opts = {
         "cookies_b64":     event_input.get("yt_cookies_b64"),
         "cookies_text":    event_input.get("yt_cookies_text"),
@@ -692,22 +667,16 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     wav, sr0 = load_audio(event_input["audio"], youtube_cap_seconds=predownload_cap_sec, youtube_opts=yt_req_opts)
     wav = resample_and_mono(wav, sr0)
 
-    # Enforce overall length limits AFTER load
+    # Enforce overall length limits
     n_samples = wav.shape[-1]
     total_seconds = n_samples / SR_TARGET
-
     limits = []
-    if MAX_DURATION_SECONDS > 0:
-        limits.append(MAX_DURATION_SECONDS)
-    if MAX_INPUT_MINUTES > 0:
-        limits.append(MAX_INPUT_MINUTES * 60.0)
+    if MAX_DURATION_SECONDS > 0: limits.append(MAX_DURATION_SECONDS)
+    if MAX_INPUT_MINUTES > 0: limits.append(MAX_INPUT_MINUTES * 60.0)
     if req_max_minutes not in (None, ""):
-        try:
-            limits.append(float(req_max_minutes) * 60.0)
-        except Exception:
-            pass
+        try: limits.append(float(req_max_minutes) * 60.0)
+        except Exception: pass
     apply_limit = min(limits) if limits else 0.0
-
     if apply_limit and total_seconds > apply_limit:
         if req_action == "truncate":
             wav = wav[:, : int(apply_limit * SR_TARGET)]
@@ -719,7 +688,7 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
                 f"Set 'max_input_action':'truncate' to auto-trim, or lower 'max_input_minutes'."
             )
 
-    # Build prompt
+    # Prompt
     base_prompt = build_prompt(task, prompt_override, source_lang, target_lang)
 
     # Generation config
@@ -735,32 +704,14 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
     # Spans (VAD or fixed windows)
     if use_vad:
         spans = make_vad_spans(
-            wav, SR_TARGET,
-            VAD_AGGRESSIVENESS, VAD_FRAME_MS,
+            wav, SR_TARGET, VAD_AGGRESSIVENESS, VAD_FRAME_MS,
             VAD_MIN_SPEECH_MS, VAD_MAX_SILENCE_MS,
             VAD_PAD_MS, VAD_MAX_SEGMENT_SECONDS
         )
     else:
         spans = _make_chunks(n_samples, SR_TARGET, CHUNK_SECONDS, CHUNK_OVERLAP)
 
-    # === Global first-speech guard: trim/drop spans before real speech ===
-    first_speech_sec = 0.0
-    if STRICT_FIRST_SPEECH:
-        first_speech_sec = _detect_first_speech_sec(
-            wav, SR_TARGET, aggr=max(3, VAD_AGGRESSIVENESS), frame_ms=20, min_consec_ms=FIRST_SPEECH_MIN_CONSEC_MS
-        )
-        if first_speech_sec > 0.0:
-            new_spans = []
-            for (st, en) in spans:
-                st_s, en_s = st / SR_TARGET, en / SR_TARGET
-                if en_s <= first_speech_sec:
-                    continue  # drop fully before first speech
-                if st_s < first_speech_sec:
-                    st = int(first_speech_sec * SR_TARGET)  # trim to the detected speech onset
-                new_spans.append((st, en))
-            spans = new_spans
-
-    # Transcribe spans + SRT with overlap de-dupe and non-speech gating
+    # Transcribe spans + universal hallucination suppression
     joined_text = ""
     prev_tail = ""
     srt_entries: List[str] = []
@@ -769,14 +720,12 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     for (st, en) in spans:
         clip = wav[:, st:en]
-
-        # --- Dynamic non-speech gating (stricter for early seconds) ---
         start_sec, end_sec = st / SR_TARGET, en / SR_TARGET
+
+        # Non-speech gating (universal)
         ratio = _speech_ratio(clip)
         dbfs  = _rms_dbfs(clip)
-        thr_ratio = MIN_SPEECH_RATIO * (1.0 + EARLY_RATIO_BOOST if end_sec <= EARLY_SECS_STRICT else 1.0)
-        is_non_speechy = (ratio < thr_ratio and dbfs < MIN_RMS_DBFS)
-        if is_non_speechy:
+        if ratio < MIN_SPEECH_RATIO and dbfs < MIN_RMS_DBFS:
             if make_srt and TAG_NON_SPEECH:
                 label = "[music]" if dbfs < -40 else "[silence]"
                 srt_entries.append(
@@ -784,21 +733,57 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 srt_index += 1
             continue
-        # --- end gating ---
 
+        # Base decode
         raw_txt, new_tok = transcribe_clip(base_prompt, clip)
         total_new_tokens += new_tok
 
-        # De-dup overlap (caused by chunk overlap or VAD padding)
-        txt = _trim_prefix_overlap(prev_tail, raw_txt)
+        # Consensus decoding across small time shifts (universal, not just intro)
+        txt = raw_txt
+        if CONSENSUS_DECODE and CONS_SHIFT_MS > 0:
+            shifts = [-CONS_SHIFT_MS, CONS_SHIFT_MS]
+            variants = []
+            dur = en - st
+            for sh_ms in shifts:
+                sh = int((sh_ms / 1000.0) * SR_TARGET)
+                if sh < 0:
+                    st_s = max(0, st + sh)
+                    en_s = min(n_samples, st_s + dur)
+                else:
+                    st_s = min(n_samples, st + sh)
+                    en_s = min(n_samples, st_s + dur)
+                    # if shifted end shorter than duration, backfill start if possible
+                    if en_s - st_s < dur:
+                        need = dur - (en_s - st_s)
+                        st_s = max(0, st_s - need)
+                if en_s - st_s <= 0:
+                    continue
+                vclip = wav[:, st_s:en_s]
+                vtxt, _ = transcribe_clip(base_prompt, vclip)
+                variants.append(vtxt)
+
+            filtered = _consensus_filter(raw_txt, variants, CONS_MIN_VOTES, CONS_JACCARD_MIN)
+
+            # If filtered is too short under low-speech conditions, treat as non-speech
+            if (not filtered or len(filtered) < CONS_MIN_KEEP_CH)) and (ratio < MIN_SPEECH_RATIO or dbfs < MIN_RMS_DBFS + 5):
+                if make_srt and TAG_NON_SPEECH:
+                    label = "[music]" if dbfs < -40 else "[silence]"
+                    srt_entries.append(
+                        f"{srt_index}\n{_sec_to_srt_ts(start_sec)} --> {_sec_to_srt_ts(end_sec)}\n{label}\n"
+                    )
+                    srt_index += 1
+                continue
+            txt = filtered or raw_txt
+
+        # De-dupe overlap vs previous span tail
+        txt = _trim_prefix_overlap(prev_tail, txt)
         if not txt.strip():
-            continue  # skip pure duplicates
+            continue
 
-        # Accumulate plain text and update tail
         joined_text = (joined_text + (" " if joined_text else "") + txt).strip()
-        prev_tail = joined_text[-120:]
+        prev_tail = joined_text[-CONS_MAX_TOK_TAIL:]
 
-        # Build SRT (split to fit line constraints; distribute time proportionally)
+        # Build SRT (split and proportionally allocate timing)
         max_chars_per_cue = SRT_MAX_CHARS_PER_LINE * SRT_MAX_LINES
         pieces = _split_text_even(txt, max_chars_per_cue)
         total_chars = sum(len(p) for p in pieces) or 1
@@ -853,9 +838,11 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
             },
             "gating": {
                 "min_speech_ratio": MIN_SPEECH_RATIO, "min_rms_dbfs": MIN_RMS_DBFS,
-                "tag_non_speech": TAG_NON_SPEECH,
-                "strict_first_speech": STRICT_FIRST_SPEECH,
-                "first_speech_sec": round(first_speech_sec, 3) if STRICT_FIRST_SPEECH else 0.0
+                "tag_non_speech": TAG_NON_SPEECH
+            },
+            "consensus": {
+                "enabled": CONSENSUS_DECODE, "shift_ms": CONS_SHIFT_MS,
+                "min_votes": CONS_MIN_VOTES, "jaccard_min": CONS_JACCARD_MIN
             },
             "tokens": {"new_tokens_sum": total_new_tokens}
         }
