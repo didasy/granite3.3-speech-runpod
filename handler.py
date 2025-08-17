@@ -752,7 +752,6 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     st_s = min(n_samples, st + sh)
                     en_s = min(n_samples, st_s + dur)
-                    # if shifted end shorter than duration, backfill start if possible
                     if en_s - st_s < dur:
                         need = dur - (en_s - st_s)
                         st_s = max(0, st_s - need)
@@ -764,8 +763,8 @@ def run_inference(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
             filtered = _consensus_filter(raw_txt, variants, CONS_MIN_VOTES, CONS_JACCARD_MIN)
 
-            # If filtered is too short under low-speech conditions, treat as non-speech
-            if (not filtered or len(filtered) < CONS_MIN_KEEP_CH)) and (ratio < MIN_SPEECH_RATIO or dbfs < MIN_RMS_DBFS + 5):
+            # FIXED: removed extra ')'
+            if (not filtered or len(filtered) < CONS_MIN_KEEP_CH) and (ratio < MIN_SPEECH_RATIO or dbfs < MIN_RMS_DBFS + 5):
                 if make_srt and TAG_NON_SPEECH:
                     label = "[music]" if dbfs < -40 else "[silence]"
                     srt_entries.append(
