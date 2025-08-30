@@ -5,6 +5,10 @@ A tidy, copy-pasteable guide for your Runpod Serverless speech worker (Granite 3
 
 ---
 
+## Notes
+
+- It works like shit. Hallucinates every single time.
+
 ## Table of Contents
 - [Specs](#specs)
 - [Environments](#environments)
